@@ -12,7 +12,7 @@
 // imports from dsh client packages - the same zero-dependency stance as the
 // host half.
 window.__ModuleLoader__.load({
-  id: '@paicat1/dsh-screenshot',
+  id: 'dsh-screenshot-pro',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
