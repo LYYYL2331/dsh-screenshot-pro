@@ -21,7 +21,7 @@
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add github:FUKKCC/dsh-screenshot-pro
+dsh plugin --profile desktop add github:LYYYL2331/dsh-screenshot-pro
 ```
 
 或本地目录：
