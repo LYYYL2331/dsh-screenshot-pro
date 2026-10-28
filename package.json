@@ -1,0 +1,41 @@
+{
+  "name": "dsh-screenshot-pro",
+  "version": "2.0.0",
+  "description": "Screen capture for DeepSeek Harness with a confirm step: drag, review, then confirm. Primary-monitor only, per-monitor DPI safe. Fork of @paicat1/dsh-screenshot.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/USER/dsh-screenshot-pro"
+  },
+  "author": "USER",
+  "type": "module",
+  "license": "MIT",
+  "main": "dsh/index.js",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "screenshot",
+    "capture"
+  ],
+  "files": [
+    "dsh",
+    "cordis.patch.yml",
+    "NOTICE"
+  ],
+  "exports": {
+    ".": "./dsh/index.js",
+    "./dsh": "./dsh/index.js",
+    "./package.json": "./package.json",
+    "./client": "./dsh/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

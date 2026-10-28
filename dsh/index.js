@@ -1,0 +1,1187 @@
+// dsh-screenshot: standalone screen-capture plugin for DeepSeek Harness.
+// Forked out of the @liustack/modlens dsh plugin (which upstream declined:
+// liustack/modlens#48). Provides the capture the browser hotkeys use and the
+// agent-facing modlens_screenshot tool. The capture itself is dependency-free
+// (PowerShell CopyFromScreen); reading the shot through modlens is optional
+// and resolved against an installed modlens CLI.
+import { spawn } from 'node:child_process'
+import { readFileSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+// Resolve the modlens CLI used to read a captured shot. MODLENS_DSH_CLI wins;
+// otherwise probe the common install locations. If none is found the capture
+// route and hotkeys still work (a path is produced); only the tool's read step
+// fails, with a clear message.
+function resolveCliPath() {
+  if (process.env.MODLENS_DSH_CLI) return process.env.MODLENS_DSH_CLI
+  const homes = [process.env.USERPROFILE, process.env.HOME].filter(Boolean)
+  const profiles = ['web', 'headless']
+  for (const home of homes) {
+    for (const profile of profiles) {
+      const p = path.join(home, '.dsh', 'profiles', profile, 'node_modules', '@liustack', 'modlens', 'dist', 'main.js')
+      try { if (statSync(p).isFile()) return p } catch {}
+    }
+  }
+  return null
+}
+
+const CLI_PATH = resolveCliPath()
+const CLI_TIMEOUT_MS = 180_000
+
+export const name = 'dsh-screenshot'
+export const inject = ['tools', 'webServer']
+
+const OUTPUT_SCHEMA = JSON.parse(readFileSync(new URL('./vision-schema.json', import.meta.url), 'utf8'))
+const CAPTURE_TIMEOUT_MS = 600_000 // region mode waits on the user
+
+// User-visible capture strings, as short bundles (en/zh) - the same
+// convention the modlens client uses for its labels. The host resolves the
+// locale from config.locale, then the DSH_SCREENSHOT_LANG environment
+// variable, then the Node ICU default (which follows the OS UI language),
+// defaulting to en. The browser half resolves its own from the document lang.
+const UI = {
+  en: {
+    bannerText: 'Click the desktop or this banner to capture · drag windows to arrange',
+    bannerHint: 'Esc to cancel',
+  },
+  zh: {
+    bannerText: '点击桌面或本横幅开始截图 · 点击窗口可排版',
+    bannerHint: 'Esc 取消',
+  },
+}
+
+let ui = UI.en
+
+function resolveUi(config = {}) {
+  const lang = String(
+    config.locale ||
+      process.env.DSH_SCREENSHOT_LANG ||
+      (typeof Intl !== 'undefined' && typeof Intl.DateTimeFormat === 'function'
+        ? Intl.DateTimeFormat().resolvedOptions().locale
+        : '') ||
+      'en',
+  ).toLowerCase()
+  ui = lang.indexOf('zh') === 0 ? UI.zh : UI.en
+  return ui
+}
+
+const CAPTURE_SCRIPT = (ui) => `param(
+    [Parameter(Mandatory=$true)][string]$OutPath,
+    [string]$Mode = 'region',
+    [switch]$Direct
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+try {
+    Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class MLDpi { [DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx); [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }' -ErrorAction SilentlyContinue
+    $dpiOk = $false
+    # Per-Monitor V2 first: keeps every monitor at its own scale instead of letting DWM stretch the overlay 1.25x on a 125% monitor.
+    try { $dpiOk = [MLDpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch { $dpiOk = $false }
+    if (-not $dpiOk) { try { $dpiOk = ([MLDpi]::SetProcessDpiAwareness(2) -eq 0) } catch { $dpiOk = $false } }
+    if (-not $dpiOk) { [MLDpi]::SetProcessDPIAware() | Out-Null }
+} catch { }
+
+# Force the overlay above everything (including topmost windows like a fullscreen browser).
+Add-Type -ReferencedAssemblies 'System.Windows.Forms','System.Drawing' -TypeDefinition '
+using System;
+using System.Runtime.InteropServices;
+public static class MLTop {
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+}
+
+// Global low-level hooks. While the pill shows, the desktop stays FULLY LIVE
+// (windows draggable): a press on a real window passes through untouched, and
+// only a press on the DESKTOP BACKGROUND (Progman/WorkerW/SHELLDLL_DefView) or
+// on the pill itself (a WindowsForms window) is swallowed and becomes the
+// capture trigger. Esc (global keyboard hook) cancels from anywhere.
+// Install uses GetModuleHandle(null) - the exe module - which is the reliable
+// way for low-level hooks (a MainModule.ModuleName lookup can return a name
+// GetModuleHandle cannot match, and SetWindowsHookEx then fails with 1428).
+public static class MLHooks {
+    public delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet=CharSet.Auto)] public static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(System.Drawing.Point pt);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtr")] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindowDC(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest, IntPtr hdcSrc, int xSrc, int ySrc, uint rop);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    public const uint PW_RENDERFULLCONTENT = 2;
+    public const uint SRCCOPY = 0x00CC0020;
+    public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+    // Content bounds excluding the DWM shadow; falls back to GetWindowRect.
+    // Some consoles report DWM bounds in DPI-virtualized coords (1.5x the
+    // physical rect), which corrupts the snap hit-test and hover outline.
+    // Content bounds must never exceed the window frame, so reject any DWM
+    // rect that spills outside GetWindowRect and use the physical frame.
+    public static bool GetWindowContentBounds(IntPtr hwnd, out RECT rect) {
+        rect = new RECT();
+        RECT gwr = new RECT();
+        bool hasGwr = GetWindowRect(hwnd, out gwr);
+        if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out rect, System.Runtime.InteropServices.Marshal.SizeOf(typeof(RECT))) == 0
+            && rect.Right > rect.Left && rect.Bottom > rect.Top) {
+            if (hasGwr && (rect.Left < gwr.Left || rect.Top < gwr.Top || rect.Right > gwr.Right || rect.Bottom > gwr.Bottom)) {
+                rect = gwr;
+            }
+            return true;
+        }
+        if (hasGwr) { rect = gwr; return true; }
+        return false;
+    }
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    public const uint GA_PARENT = 1;
+    public const uint GA_ROOT = 2;
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_TOOLWINDOW = 0x00000080;
+    public const int WH_MOUSE_LL = 14;
+    public const int WH_KEYBOARD_LL = 13;
+    public const int WM_LBUTTONDOWN = 0x0201;
+    public const int WM_RBUTTONDOWN = 0x0204;
+    public const int WM_KEYDOWN = 0x0100;
+    public const int VK_ESCAPE = 0x1B;
+    public const int VK_LBUTTON = 0x01;
+    public static LowLevelProc MouseProc = MouseCallback;
+    public static LowLevelProc KeyProc = KeyCallback;
+    public static IntPtr MouseHook = IntPtr.Zero;
+    public static IntPtr KeyHook = IntPtr.Zero;
+    public static bool Armed = false;
+    public static int LastError = 0;
+    public static int TriggerButton = 0;   // 0 = none, 1 = left, 2 = right
+    public static int ClickX = 0;
+    public static int ClickY = 0;
+    public static bool CancelRequested = false;
+    public static string ClassOf(IntPtr hwnd) {
+        var sb = new System.Text.StringBuilder(256);
+        GetClassName(hwnd, sb, 256);
+        return sb.ToString();
+    }
+    private static bool IsDesktopClass(string cls) {
+        return cls == "Progman" || cls == "WorkerW" || cls == "SHELLDLL_DefView";
+    }
+    // WindowFromPoint returns the DEEPEST child window: a click on desktop
+    // blank space usually lands on the icon list (SysListView32) whose PARENT
+    // chain walks up to SHELLDLL_DefView/Progman. So walk the parent chain
+    // (bounded) instead of comparing only the hit window class. An Explorer
+    // own list view (CabinetWClass chain) never reaches a desktop class, so
+    // real window interaction still passes through. The pill itself is a
+    // top-level WindowsForms window and matches directly.
+    public static bool IsDesktopOrPill(IntPtr hwnd) {
+        string cls = ClassOf(hwnd);
+        if (cls.StartsWith("WindowsForms")) return true;
+        IntPtr cur = hwnd;
+        for (int i = 0; i < 10 && cur != IntPtr.Zero; i++) {
+            if (IsDesktopClass(ClassOf(cur))) return true;
+            cur = GetAncestor(cur, GA_PARENT);
+        }
+        return false;
+    }
+    public static IntPtr MouseCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && Armed) {
+            int msg = (int)wParam;
+            if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
+                int x = Marshal.ReadInt32(lParam, 0);
+                int y = Marshal.ReadInt32(lParam, 4);
+                // Desktop background (direct or via the icon list parent
+                // chain) or our own pill: the capture trigger. Swallow it so
+                // the desktop gets no click and no context menu. Everything
+                // else passes through (never swallow real window interaction).
+                if (IsDesktopOrPill(WindowFromPoint(new System.Drawing.Point(x, y)))) {
+                    TriggerButton = msg == WM_LBUTTONDOWN ? 1 : 2;
+                    ClickX = x; ClickY = y;
+                    return new IntPtr(1);
+                }
+            }
+        }
+        return CallNextHookEx(MouseHook, nCode, wParam, lParam);
+    }
+    public static IntPtr KeyCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && (int)wParam == WM_KEYDOWN) {
+            if (Marshal.ReadInt32(lParam) == VK_ESCAPE) CancelRequested = true;
+        }
+        return CallNextHookEx(KeyHook, nCode, wParam, lParam);
+    }
+    public static void Install() {
+        IntPtr hMod = GetModuleHandle(null);
+        MouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hMod, 0);
+        KeyHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyProc, hMod, 0);
+        if (MouseHook == IntPtr.Zero || KeyHook == IntPtr.Zero) {
+            LastError = Marshal.GetLastWin32Error();
+            if (MouseHook != IntPtr.Zero) { UnhookWindowsHookEx(MouseHook); MouseHook = IntPtr.Zero; }
+            if (KeyHook != IntPtr.Zero) { UnhookWindowsHookEx(KeyHook); KeyHook = IntPtr.Zero; }
+        }
+        Armed = (MouseHook != IntPtr.Zero);
+    }
+    public static void UninstallMouse() {
+        Armed = false;
+        if (MouseHook != IntPtr.Zero) { UnhookWindowsHookEx(MouseHook); MouseHook = IntPtr.Zero; }
+    }
+    public static void UninstallKeys() {
+        if (KeyHook != IntPtr.Zero) { UnhookWindowsHookEx(KeyHook); KeyHook = IntPtr.Zero; }
+    }
+    public static bool LeftButtonDown() {
+        return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    }
+}' -ErrorAction SilentlyContinue
+
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds   # primary monitor only (virtual screen would span both displays)
+$width = $screen.Width
+$height = $screen.Height
+
+# ── full mode: capture immediately, no interaction ──
+if ($Mode -eq 'full') {
+    $bmp = New-Object System.Drawing.Bitmap($width, $height)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.CopyFromScreen($screen.X, $screen.Y, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    }
+    $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    try { [System.Windows.Forms.Clipboard]::SetText($OutPath) } catch { }
+    $g.Dispose()
+    $bmp.Dispose()
+    exit 0
+}
+
+# ── region mode: arrange-then-capture. Activation shows only a hint pill and
+# leaves the desktop FULLY LIVE (windows stay draggable - the user can arrange
+# and even switch away from the DSH page). A global low-level mouse hook
+# swallows a press on the DESKTOP BACKGROUND or on the pill; that press is the
+# trigger - CopyFromScreen grabs the CURRENT layout immediately, then a frosted
+# overlay shows the sharp original inside the drag selection. Presses on real
+# windows pass through untouched so arranging keeps working. Esc (global
+# keyboard hook or pill) cancels; a 5-minute idle timer auto-cancels.
+if (-not $Direct) {
+$bannerText = '${ui.bannerText}'
+$bannerHint = '${ui.bannerHint}'
+$bannerFont = New-Object System.Drawing.Font('Microsoft YaHei', 17)
+$hintFont = New-Object System.Drawing.Font('Microsoft YaHei', 13)
+$tempBmp = New-Object System.Drawing.Bitmap(4, 4)
+$tempG = [System.Drawing.Graphics]::FromImage($tempBmp)
+$textW = [System.Windows.Forms.TextRenderer]::MeasureText($tempG, $bannerText, $bannerFont).Width
+# Split the hint into a keycap "Esc" + the rest of the text.
+$escText = 'Esc'
+$hintRest = $bannerHint
+if ($hintRest.StartsWith('Esc')) { $hintRest = $hintRest.Substring(3).TrimStart() }
+$hintW = [System.Windows.Forms.TextRenderer]::MeasureText($tempG, $hintRest, $hintFont).Width
+$tempG.Dispose()
+$tempBmp.Dispose()
+$escW = 52
+$escH = 30
+$bannerW = [int](28 + ($textW + 16) + 22 + $escW + 8 + $hintW + 28)
+$bannerH = 78
+
+# Hint pill: white rounded rect. Clickable as a fallback trigger (the hook
+# normally swallows pill presses and fires itself).
+$banner = New-Object System.Windows.Forms.Form
+$banner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$banner.TopMost = $true
+$banner.ShowInTaskbar = $false
+$banner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$banner.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
+$banner.Opacity = 0.85
+$banner.KeyPreview = $true
+$banner.SetBounds(($screen.X + ($width - $bannerW) / 2), ($screen.Y + 16), $bannerW, $bannerH)
+
+$cornerPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+$radius = 12
+$cornerPath.AddArc(0, 0, $radius * 2, $radius * 2, 180, 90)
+$cornerPath.AddArc(($bannerW - $radius * 2), 0, $radius * 2, $radius * 2, 270, 90)
+$cornerPath.AddArc(($bannerW - $radius * 2), ($bannerH - $radius * 2), $radius * 2, $radius * 2, 0, 90)
+$cornerPath.AddArc(0, ($bannerH - $radius * 2), $radius * 2, $radius * 2, 90, 90)
+$cornerPath.CloseFigure()
+$banner.Region = New-Object System.Drawing.Region($cornerPath)
+
+$banner.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::FromArgb(45, 45, 45))
+    $border = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 120, 120))
+    $border.Width = 2
+    $g.DrawRectangle($border, 1, 1, $banner.Width - 3, $banner.Height - 3)
+    $border.Dispose()
+})
+
+$bannerLabel = New-Object System.Windows.Forms.Label
+$bannerLabel.Text = $bannerText
+$bannerLabel.Font = $bannerFont
+$bannerLabel.ForeColor = [System.Drawing.Color]::White
+# +16px slack: TextRenderer.MeasureText can under-report the rendered width by
+# a few px, which clipped the last glyph ("消" in the zh hint). The label is
+# AutoSize=false, so give it room to avoid the clip.
+$bannerLabel.SetBounds(28, 16, ($textW + 16), 46)
+$bannerLabel.AutoSize = $false
+$banner.Controls.Add($bannerLabel)
+
+# Keycap "Esc": dark rounded chip with a light border, like a real key.
+$escKey = New-Object System.Windows.Forms.Label
+$escKey.Text = $escText
+$escKey.Font = $hintFont
+$escKey.ForeColor = [System.Drawing.Color]::White
+$escKey.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
+$escKey.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$escKey.SetBounds((28 + $textW + 16 + 22), 24, $escW, $escH)
+$escKey.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $r = New-Object System.Drawing.Rectangle(1, 1, ($escKey.Width - 2), ($escKey.Height - 2))
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $rad = 5
+    $path.AddArc($r.X, $r.Y, $rad * 2, $rad * 2, 180, 90)
+    $path.AddArc(($r.Right - $rad * 2), $r.Y, $rad * 2, $rad * 2, 270, 90)
+    $path.AddArc(($r.Right - $rad * 2), ($r.Bottom - $rad * 2), $rad * 2, $rad * 2, 0, 90)
+    $path.AddArc($r.X, ($r.Bottom - $rad * 2), $rad * 2, $rad * 2, 90, 90)
+    $path.CloseFigure()
+    $g.FillPath((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(60, 60, 60))), $path)
+    $g.DrawPath((New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 200, 200), 1)), $path)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $g.DrawString($escKey.Text, $escKey.Font, (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)), [System.Drawing.RectangleF]$r, $sf)
+    $path.Dispose()
+    $sf.Dispose()
+})
+$banner.Controls.Add($escKey)
+
+$hintLabel = New-Object System.Windows.Forms.Label
+$hintLabel.Text = $hintRest
+$hintLabel.Font = $hintFont
+$hintLabel.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+$hintLabel.SetBounds((28 + $textW + 16 + 22 + $escW + 8), 18, $hintW, 42)
+$hintLabel.AutoSize = $false
+$hintLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$banner.Controls.Add($hintLabel)
+
+$banner.Add_KeyDown({
+    param($sender, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+        $script:pillTrigger = -1
+        $banner.Close()
+    }
+})
+# Fallback trigger when the mouse hook is unavailable: clicking the pill.
+$banner.Add_MouseClick({
+    param($sender, $e)
+    if (($e.Button -eq [System.Windows.Forms.MouseButtons]::Left -or $e.Button -eq [System.Windows.Forms.MouseButtons]::Right) -and $script:pillTrigger -eq 0) {
+        $script:pillTrigger = if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { 2 } else { 1 }
+        $script:clickX = $banner.Left + $e.X
+        $script:clickY = $banner.Top + $e.Y
+        $banner.Close()
+    }
+})
+$banner.Add_Shown({
+    param($sender, $e)
+    try { [MLTop]::SetWindowPos($banner.Handle, (New-Object IntPtr -ArgumentList (-1)), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null } catch { }
+})
+
+$script:pillTrigger = 0
+$script:clickX = 0
+$script:clickY = 0
+
+# Install the global hooks. If they fail, keep going with the pill fallback
+# and write the reason to stderr so the host log shows it.
+[MLHooks]::Install()
+if (-not [MLHooks]::Armed) {
+    [Console]::Error.WriteLine('[modlens] global mouse hook failed (err ' + [MLHooks]::LastError + '), using pill click as the only trigger')
+}
+
+# Poll the hook flags while the pill modal loop runs.
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 100
+$script:ticks = 0
+$timer.Add_Tick({
+    $script:ticks++
+    if ([MLHooks]::CancelRequested) {
+        $script:pillTrigger = -1
+        $banner.Close()
+    } elseif ([MLHooks]::TriggerButton -ne 0 -and $script:pillTrigger -eq 0) {
+        $script:pillTrigger = [MLHooks]::TriggerButton
+        $script:clickX = [MLHooks]::ClickX
+        $script:clickY = [MLHooks]::ClickY
+        $banner.Close()
+    } elseif ($script:ticks -gt 3000 -and $script:pillTrigger -eq 0) {
+        # 5 minute idle safety net: auto-cancel instead of hanging forever.
+        $script:pillTrigger = -1
+        $banner.Close()
+    }
+})
+$timer.Start()
+$banner.ShowDialog()
+$timer.Stop()
+$timer.Dispose()
+$banner.Dispose()
+
+$tb = $script:pillTrigger
+$cx = $script:clickX
+$cy = $script:clickY
+[MLHooks]::UninstallMouse()
+if ($tb -le 0) { [MLHooks]::UninstallKeys(); exit 2 }
+}
+
+# ── capture NOW (the arranged layout), then select on a frosted overlay ──
+$bmp = New-Object System.Drawing.Bitmap($width, $height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+try {
+    $g.CopyFromScreen($screen.X, $screen.Y, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    [MLHooks]::UninstallKeys()
+    exit 1
+}
+
+$script:blurFull = $null
+
+# Full-screen selection overlay: frosted backdrop, sharp original inside the
+# drag selection.
+$form = New-Object System.Windows.Forms.Form
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$form.SetBounds($screen.X, $screen.Y, $width, $height)
+$form.TopMost = $true
+$form.ShowInTaskbar = $false
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None   # __noAutoScale
+$form.Cursor = [System.Windows.Forms.Cursors]::Cross
+$form.KeyPreview = $true
+try {
+    $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Instance)
+    $dbProp.SetValue($form, $true, $null)
+} catch { }
+$script:startPoint = $null
+$script:selection = $null
+$script:drawing = $false
+$script:armAt = [DateTime]::MinValue
+$script:windowSnap = $false
+$script:hoverRect = $null
+$script:hoverHwnd = [IntPtr]::Zero
+$script:ptX = 0
+$script:ptY = 0
+$script:windowHwndAtPoint = [IntPtr]::Zero
+$script:windowRectAtPoint = $null
+$script:windowOuterRect = New-Object MLHooks+RECT
+# Window-snap enumeration callback: the topmost visible non-desktop window
+# under the cursor (the overlay itself is excluded by handle). EnumWindows
+# walks top-to-bottom in Z-order, so the first hit is the front-most window.
+$script:windowEnumCb = [MLHooks+EnumWindowsProc]{
+    param($hwnd, $lParam)
+    if (-not [MLHooks]::IsWindowVisible($hwnd)) { return $true }
+    $ex = [MLHooks]::GetWindowLongPtr($hwnd, [MLHooks]::GWL_EXSTYLE)
+    if (($ex.ToInt64() -band [MLHooks]::WS_EX_TOOLWINDOW) -ne 0) { return $true }
+    if ($hwnd -eq $form.Handle) { return $true }
+    $cls = [MLHooks]::ClassOf($hwnd)
+    if ($cls -eq 'Progman' -or $cls -eq 'WorkerW' -or $cls -eq 'SHELLDLL_DefView') { return $true }
+    $r = New-Object MLHooks+RECT
+    # Content bounds excluding the window shadow (falls back to GetWindowRect),
+    # so the snap outline and the PrintWindow bitmap hug the real window.
+    if (-not [MLHooks]::GetWindowContentBounds($hwnd, [ref]$r)) { return $true }
+    if ($script:ptX -ge $r.Left -and $script:ptX -lt $r.Right -and $script:ptY -ge $r.Top -and $script:ptY -lt $r.Bottom) {
+        $script:windowHwndAtPoint = $hwnd
+        $script:windowRectAtPoint = $r
+        [MLHooks]::GetWindowRect($hwnd, [ref]$script:windowOuterRect) | Out-Null
+        return $false
+    }
+    return $true
+}
+
+# ── confirm bar: two plain buttons (no container, no border) ──
+$barW = 162
+$barH = 36
+$okBtn = New-Object System.Windows.Forms.Button
+$okBtn.Text = '确定'
+$okBtn.Size = New-Object System.Drawing.Size(78, 36)
+$okBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$okBtn.FlatAppearance.BorderSize = 0
+$okBtn.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$okBtn.ForeColor = [System.Drawing.Color]::White
+$okBtn.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10, [System.Drawing.FontStyle]::Bold)
+$okBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+$okBtn.TabStop = $false
+$okBtn.Visible = $false
+$okBtn.Add_Click({
+    if ($script:armAt -gt [DateTime]::Now) { return }
+    $script:windowSnap = $false
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Close()
+})
+$cancelBtn = New-Object System.Windows.Forms.Button
+$cancelBtn.Text = '取消'
+$cancelBtn.Size = New-Object System.Drawing.Size(78, 36)
+$cancelBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$cancelBtn.FlatAppearance.BorderSize = 0
+$cancelBtn.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 66)
+$cancelBtn.ForeColor = [System.Drawing.Color]::White
+$cancelBtn.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10)
+$cancelBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+$cancelBtn.TabStop = $false
+$cancelBtn.Visible = $false
+$cancelBtn.Add_Click({
+    if ($script:armAt -gt [DateTime]::Now) { return }
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Close()
+})
+$form.Controls.Add($okBtn)
+$form.Controls.Add($cancelBtn)
+$showTimer = New-Object System.Windows.Forms.Timer
+$showTimer.Interval = 320
+$showTimer.Add_Tick({
+    $showTimer.Stop()
+    $script:hoverRect = $null   # __nohover
+    $sel2 = $script:selection
+    if ($null -eq $sel2 -or $sel2.Width -lt 3 -or $sel2.Height -lt 3) { return }
+    $bx = $sel2.Right - $barW
+    $by = $sel2.Bottom + 6
+    if (($sel2.Width -lt $barW) -or (($by + $barH) -gt $height)) {
+        $bx = $sel2.Right - $barW
+        $by = $sel2.Bottom - $barH - 6
+    }
+    if ($bx -lt 4) { $bx = 4 }
+    if (($bx + $barW) -gt ($width - 4)) { $bx = $width - $barW - 4 }
+    if ($by -lt 4) { $by = 4 }
+    $okBtn.Location = New-Object System.Drawing.Point($bx, $by)
+    $cancelBtn.Location = New-Object System.Drawing.Point(($bx + 84), $by)
+    $script:armAt = [DateTime]::Now.AddMilliseconds(350)
+    $okBtn.Visible = $true
+    $cancelBtn.Visible = $true
+    $okBtn.BringToFront()
+    $cancelBtn.BringToFront()
+})
+$form.Add_Paint({
+    param($sender, $e)
+    try {   # __paintTry
+    $gfx = $e.Graphics
+    # Sharp original, dimmed full-screen (no blur): the whole screen stays
+    # readable while the selection reveals a clear window inside it.
+    $gfx.DrawImage($bmp, 0, 0, $width, $height)
+    $dim = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(135, 0, 0, 0))
+    $gfx.FillRectangle($dim, 0, 0, $width, $height)
+    $dim.Dispose()
+    $sel = $script:selection
+    if ($null -ne $sel -and $sel.Width -gt 0 -and $sel.Height -gt 0) {
+        # sharp original inside the selection (covers the dim)
+        $gfx.SetClip($sel)
+        $gfx.DrawImage($bmp, 0, 0, $width, $height)
+        $gfx.ResetClip()
+        # border
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 120, 215), 2)
+        $gfx.DrawRectangle($pen, $sel)
+        $pen.Dispose()
+        # size label
+        $label = ($sel.Width).ToString() + ' x ' + ($sel.Height).ToString()
+        $font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+        $size = $gfx.MeasureString($label, $font)
+        $bx = $sel.X + 2
+        $by = $sel.Y - $size.Height - 4
+        if ($by -lt 0) { $by = $sel.Y + 2 }
+        $gfx.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200, 0, 0, 0))), $bx, $by, $size.Width + 8, $size.Height + 4)
+        $gfx.DrawString($label, $font, (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)), $bx + 4, $by + 2)
+        $font.Dispose()
+    }
+    # Window-snap highlight: hovering over a real window reveals it sharp
+    # inside the dimmed screen and outlines it; a click captures that window.
+    $hr = $script:hoverRect
+    if ($null -eq $script:selection -and $null -ne $hr -and -not $script:drawing -and $hr.Width -gt 0 -and $hr.Height -gt 0) {
+        $gfx.SetClip($hr)
+        $gfx.DrawImage($bmp, 0, 0, $width, $height)
+        $gfx.ResetClip()
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 0, 120, 215), 2)
+        $gfx.DrawRectangle($pen, $hr)
+        $pen.Dispose()
+        $sb = New-Object System.Text.StringBuilder(256)
+        [MLHooks]::GetWindowText($script:hoverHwnd, $sb, 256) | Out-Null
+        $title = $sb.ToString()
+        if ($title) {
+            $tfont = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+            $tsize = $gfx.MeasureString($title, $tfont)
+            $tbx = $hr.X + 2
+            $tby = $hr.Y - $tsize.Height - 4
+            if ($tby -lt 0) { $tby = $hr.Y + 2 }
+            $gfx.FillRectangle((New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 0, 120, 215))), $tbx, $tby, $tsize.Width + 8, $tsize.Height + 4)
+            $gfx.DrawString($title, $tfont, (New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)), $tbx + 4, $tby + 2)
+            $tfont.Dispose()
+        }
+    }
+    } catch {   # __paintTry
+    }
+})
+$form.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left -and -not $script:drawing) {
+        # Re-selection on the already captured image (the image is what the
+        # user sees, so a fresh press starts a new box over the same shot).
+        $script:startPoint = $e.Location
+        $showTimer.Stop()
+        $okBtn.Visible = $false
+        $cancelBtn.Visible = $false
+        $script:selection = New-Object System.Drawing.Rectangle($e.Location, (New-Object System.Drawing.Size(0, 0)))
+        $script:drawing = $true
+        $form.Invalidate()
+    }
+})
+$form.Add_MouseMove({
+    param($sender, $e)
+    if ($okBtn.Visible) { return }   # __freeze
+    if ($script:drawing -and $null -ne $script:startPoint) {
+        $x = [Math]::Min($script:startPoint.X, $e.X)
+        $y = [Math]::Min($script:startPoint.Y, $e.Y)
+        $w = [Math]::Abs($script:startPoint.X - $e.X)
+        $h = [Math]::Abs($script:startPoint.Y - $e.Y)
+        $script:selection = New-Object System.Drawing.Rectangle($x, $y, $w, $h)
+        $form.Invalidate()
+    } else {
+        # Window-snap: outline the topmost visible window under the cursor.
+        $script:ptX = $e.X + $screen.X
+        $script:ptY = $e.Y + $screen.Y
+        $script:windowHwndAtPoint = [IntPtr]::Zero
+        $script:windowRectAtPoint = $null
+        [MLHooks]::EnumWindows($script:windowEnumCb, [IntPtr]::Zero) | Out-Null
+        if ($null -ne $script:windowRectAtPoint) {
+            $r = $script:windowRectAtPoint
+            $hr = New-Object System.Drawing.Rectangle(($r.Left - $screen.X), ($r.Top - $screen.Y), ($r.Right - $r.Left), ($r.Bottom - $r.Top))
+            if ($null -eq $script:hoverRect -or -not $hr.Equals($script:hoverRect)) {
+                $script:hoverRect = $hr
+                $script:hoverHwnd = $script:windowHwndAtPoint
+                $form.Invalidate()
+            }
+        } elseif ($null -ne $script:hoverRect) {
+            $script:hoverRect = $null
+            $script:hoverHwnd = [IntPtr]::Zero
+            $form.Invalidate()
+        }
+    }
+})
+$form.Add_MouseUp({
+    param($sender, $e)
+    # __confirmGuard: while the confirm bar is up, clicks must not capture
+    if ($okBtn.Visible) { return }
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:drawing) {
+        $script:drawing = $false
+        $x = [Math]::Min($script:startPoint.X, $e.X)
+        $y = [Math]::Min($script:startPoint.Y, $e.Y)
+        $w = [Math]::Abs($script:startPoint.X - $e.X)
+        $h = [Math]::Abs($script:startPoint.Y - $e.Y)
+        $script:selection = New-Object System.Drawing.Rectangle($x, $y, $w, $h)
+        if ($w -ge 3 -and $h -ge 3) {
+            # Drag-select: always capture the user's rectangle (may span the
+            # whole desktop). Never let a window snap hijack a drag.
+            $script:windowSnap = $false
+            # Defer the buttons: showing them right under the releasing
+            # cursor gets the mouse-up swallowed as a click.
+            $showTimer.Stop()
+            $showTimer.Start()
+            $script:hoverRect = $null   # __freeze
+            $script:hoverHwnd = [IntPtr]::Zero
+            $form.Invalidate()
+        } elseif ($null -ne $script:hoverRect -and $script:hoverRect.Width -gt 0 -and $script:hoverRect.Height -gt 0) {
+            # A click on a snapped window captures that window - UNLESS it
+            # spans nearly the whole screen (a maximized/full-screen app, e.g.
+            # the IDE itself). That is the "click the desktop for a
+            # full-screen capture" case: grab the whole desktop instead of
+            # relying on PrintWindow of a full-screen window.
+            $hoverArea = [double]$script:hoverRect.Width * $script:hoverRect.Height
+            $screenArea = [double]$width * $height
+            if ($hoverArea -ge ($screenArea * 0.9)) {
+                $script:selection = New-Object System.Drawing.Rectangle(0, 0, $width, $height)
+                $script:windowSnap = $false
+            } else {
+                $script:selection = $script:hoverRect
+                $script:windowSnap = $true
+            }
+            # Same confirm step as a drag selection: hold the frame and
+            # wait for the user to click 确定.
+            $showTimer.Stop()
+            $showTimer.Start()
+            $script:hoverRect = $null
+            $form.Invalidate()
+        } else {
+            # A click on the desktop background (no window snapped, no drag)
+            # captures the whole desktop: the "full screen" quick path.
+            $script:selection = New-Object System.Drawing.Rectangle(0, 0, $width, $height)
+            $script:windowSnap = $false
+            # Same confirm step as a drag selection: hold the frame and
+            # wait for the user to click 确定.
+            $showTimer.Stop()
+            $showTimer.Start()
+            $script:hoverRect = $null
+            $form.Invalidate()
+        }
+    }
+})
+$form.Add_KeyDown({
+    param($sender, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter -and $okBtn.Visible) { $okBtn.PerformClick(); return }
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $form.Close()
+    }
+})
+$form.Add_FormClosing({ param($s2, $e2)
+})
+$form.Add_Shown({
+    param($sender, $e)
+    try { [MLTop]::SetWindowPos($form.Handle, (New-Object IntPtr -ArgumentList (-1)), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null } catch { }
+    $form.Activate()
+    # The user may still be holding the button when the overlay appears (a
+    # fast second click that landed before the overlay finished showing).
+    # Anchor the drag to the CURRENT cursor position, not the original
+    # trigger point - otherwise a desktop click that should capture the full
+    # screen becomes a huge start-to-click rectangle instead.
+    if ([MLHooks]::LeftButtonDown()) {
+        $cur = [System.Windows.Forms.Cursor]::Position
+        $local = New-Object System.Drawing.Point(($cur.X - $screen.X), ($cur.Y - $screen.Y))
+        $script:startPoint = $local
+        $script:selection = New-Object System.Drawing.Rectangle($local, (New-Object System.Drawing.Size(0, 0)))
+        $script:drawing = $true
+    }
+    $form.Invalidate()
+})
+
+# Window capture via PrintWindow: asks the target window to render itself into
+# a fresh bitmap, so the shot is the window's own content (including its title
+# bar and borders), not whatever occludes it on screen. PW_RENDERFULLCONTENT
+# (2) makes UWP / DirectComposition windows render their full content.
+# Returns $null on failure; Test-BlankBitmap guards against a blank result
+# (some GPU-rendered windows return a white/black buffer).
+function Capture-WindowPrint {
+    param([IntPtr]$Hwnd, [int]$W, [int]$H)
+    if ($Hwnd -eq [IntPtr]::Zero -or $W -le 0 -or $H -le 0) { return $null }
+    $bmp = New-Object System.Drawing.Bitmap($W, $H)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    $ok = $false
+    try {
+        $ok = [MLHooks]::PrintWindow($Hwnd, $hdc, [MLHooks]::PW_RENDERFULLCONTENT)
+    } finally {
+        $g.ReleaseHdc($hdc)
+        $g.Dispose()
+    }
+    if (-not $ok) { $bmp.Dispose(); return $null }
+    return $bmp
+}
+
+# BitBlt fallback for windows PrintWindow cannot render (console windows and
+# some GPU-composited windows don't implement WM_PRINT). Grabs the window's
+# OWN device context, so the content is the window's, not whatever occludes it.
+# GetWindowDC returns the full window DC (including the non-client title bar),
+# whose origin is the window's top-left in screen coordinates - matching the
+# GWR-sized bitmap we create.
+function Capture-WindowBitBlt {
+    param([IntPtr]$Hwnd, [int]$W, [int]$H)
+    if ($Hwnd -eq [IntPtr]::Zero -or $W -le 0 -or $H -le 0) { return $null }
+    $bmp = New-Object System.Drawing.Bitmap($W, $H)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    $winDc = [MLHooks]::GetWindowDC($Hwnd)
+    $ok = $false
+    if ($winDc -ne [IntPtr]::Zero) {
+        $ok = [MLHooks]::BitBlt($hdc, 0, 0, $W, $H, $winDc, 0, 0, [MLHooks]::SRCCOPY)
+        [MLHooks]::ReleaseDC($Hwnd, $winDc) | Out-Null
+    }
+    $g.ReleaseHdc($hdc)
+    $g.Dispose()
+    if (-not $ok) { $bmp.Dispose(); return $null }
+    return $bmp
+}
+
+function Test-BlankBitmap {
+    param($Bmp)
+    if ($null -eq $Bmp) { return $true }
+    # Asymmetric 5x5 sampling grid: breaks the row/column alignment that
+    # makes a uniform 0.25-step grid land entirely in monospace line gaps
+    # of a console window. With non-divisor steps (0.1, 0.3, 0.5, 0.7, 0.9
+    # offset to 0.13, 0.34, 0.51, 0.72, 0.88) every cell straddles text rows
+    # AND background, so a real window is never mistaken for blank.
+    $xs = @(0.1, 0.34, 0.5, 0.72, 0.9)
+    $ys = @(0.13, 0.31, 0.51, 0.69, 0.88)
+    $pts = @()
+    foreach ($y in $ys) {
+        foreach ($x in $xs) {
+            # ,@() keeps each point as ONE array element (a bare += @(x,y) would
+            # flatten the pair into two ints and break the loop below).
+            $pts += ,@([int]($Bmp.Width * $x), [int]($Bmp.Height * $y))
+        }
+    }
+    $first = $null
+    foreach ($p in $pts) {
+        if ($p[0] -lt 0 -or $p[1] -lt 0 -or $p[0] -ge $Bmp.Width -or $p[1] -ge $Bmp.Height) { continue }
+        $c = $Bmp.GetPixel($p[0], $p[1])
+        if ($null -eq $first) { $first = $c.ToArgb() }
+        elseif ($c.ToArgb() -ne $first) { return $false }
+    }
+    return $true
+}
+
+$result = $form.ShowDialog()
+[MLHooks]::UninstallKeys()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $null -ne $script:selection -and $script:selection.Width -ge 3 -and $script:selection.Height -ge 3) {
+    $saved = $false
+    if ($script:windowSnap -and $null -ne $script:hoverHwnd -and $script:hoverHwnd -ne [IntPtr]::Zero) {
+        # Window-snap capture: PrintWindow the target so the shot is the
+        # window's own content even when occluded.
+        $gr = $script:windowOuterRect
+        $cr = $script:windowRectAtPoint
+        # PrintWindow paints relative to the window's OUTER frame, so the bitmap
+        # must be sized to GetWindowRect; Chromium windows otherwise shift by the
+        # shadow inset (left blank band, right edge clipped). After capture, crop
+        # to the DWM content rect to drop the shadow halo entirely.
+        $gwrW = $gr.Right - $gr.Left
+        $gwrH = $gr.Bottom - $gr.Top
+        if ($gwrW -gt 0 -and $gwrH -gt 0 -and $null -ne $cr) {
+            $winBmp = Capture-WindowPrint $script:hoverHwnd $gwrW $gwrH
+            if ($null -ne $winBmp -and (Test-BlankBitmap $winBmp)) {
+                # PrintWindow rendered blank (console / some GPU windows don't
+                # implement WM_PRINT): drop it and fall through to BitBlt.
+                $winBmp.Dispose()
+                $winBmp = $null
+            }
+            if ($null -eq $winBmp) {
+                # PrintWindow failed outright (returns $null, e.g. some conhost
+                # consoles) or rendered blank: BitBlt the window's own device
+                # context, which still carries its content.
+                $winBmp = Capture-WindowBitBlt $script:hoverHwnd $gwrW $gwrH
+            }
+            if ($null -ne $winBmp -and -not (Test-BlankBitmap $winBmp)) {
+                # Crop to the DWM content rect, CLAMPED to the GWR bitmap. Some
+                # consoles report DWM bounds in DPI-virtualized coords (1.5x the
+                # physical rect), which would overflow the bitmap and throw
+                # "Out of memory" from Clone. Only clip when the content rect
+                # actually sits INSIDE the outer rect (the shadow-inset case);
+                # otherwise fall back to the full outer rect (consoles have no
+                # shadow to drop, and its content fills the whole frame).
+                $cbInside = ($cr.Left -ge $gr.Left) -and ($cr.Top -ge $gr.Top) -and ($cr.Right -le $gr.Right) -and ($cr.Bottom -le $gr.Bottom)
+                if ($cbInside) {
+                    $cropX = $cr.Left - $gr.Left
+                    $cropY = $cr.Top - $gr.Top
+                    $cropW = $cr.Right - $cr.Left
+                    $cropH = $cr.Bottom - $cr.Top
+                } else {
+                    $cropX = 0; $cropY = 0; $cropW = $gwrW; $cropH = $gwrH
+                }
+                if ($cropW -gt 0 -and $cropH -gt 0) {
+                    $cbRect = New-Object System.Drawing.Rectangle($cropX, $cropY, $cropW, $cropH)
+                    $crop = $winBmp.Clone($cbRect, $winBmp.PixelFormat)
+                    $crop.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                    try { [System.Windows.Forms.Clipboard]::SetText($OutPath) } catch { }
+                    $crop.Dispose()
+                    $saved = $true
+                }
+                $winBmp.Dispose()
+            } elseif ($null -ne $winBmp) {
+                $winBmp.Dispose()
+            }
+            # Both PrintWindow and BitBlt came back blank (consoles don't render
+            # their GDI surface when not foreground, so BitBlt grabs nothing):
+            # fall back to the PRE-captured screen pixels of the hovered window.
+            # The full-screen snapshot was taken right after the trigger and
+            # before the overlay, when the snapped window was still live on
+            # screen, so this yields the visible content - same as a drag-select.
+            if (-not $saved -and $null -ne $script:hoverRect -and $script:hoverRect.Width -gt 0 -and $script:hoverRect.Height -gt 0) {
+                try {
+                    $crop = $bmp.Clone($script:hoverRect, $bmp.PixelFormat)
+                    $crop.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                    try { [System.Windows.Forms.Clipboard]::SetText($OutPath) } catch { }
+                    $crop.Dispose()
+                    $saved = $true
+                } catch { }
+            }
+        }
+    } else {
+        # Drag-select path: crop the captured pixels (visible content).
+        $crop = $bmp.Clone($script:selection, $bmp.PixelFormat)
+        $crop.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        try { [System.Windows.Forms.Clipboard]::SetText($OutPath) } catch { }
+        $crop.Dispose()
+        $saved = $true
+    }
+    if ($saved) {
+        $g.Dispose()
+        $bmp.Dispose()
+        if ($null -ne $script:blurFull) { $script:blurFull.Dispose() }
+        $form.Dispose()
+        exit 0
+    }
+    # Window-snap capture failed (blank/invalid PrintWindow): cancel so the
+    # browser toasts nothing and the user can retry with a drag-select.
+    $g.Dispose()
+    $bmp.Dispose()
+    if ($null -ne $script:blurFull) { $script:blurFull.Dispose() }
+    $form.Dispose()
+    exit 2
+}
+$g.Dispose()
+$bmp.Dispose()
+if ($null -ne $script:blurFull) { $script:blurFull.Dispose() }
+$form.Dispose()
+exit 2
+exit 2`
+
+// A screenshot capture is inherently single-user: two overlays at once would
+// fight over the screen. The flag serializes route calls and tool calls alike.
+let captureBusy = false
+
+async function captureScreenshot(mode, signal, direct) {
+  if (captureBusy) {
+    throw new Error('another screenshot capture is already running')
+  }
+  captureBusy = true
+  let dir
+  try {
+    const { mkdir, mkdtemp, writeFile, rm } = await import('node:fs/promises')
+    const { homedir, tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    dir = await mkdtemp(join(tmpdir(), 'modlens-dsh-shot-'))
+    const scriptPath = join(dir, 'capture.ps1')
+    // PNGs land in <home>\Downloads\modlens-screenshots with a readable
+    // timestamped name, so the user can find and delete them easily (temp-dir
+    // files were effectively invisible garbage). The script itself stays in a
+    // private 0600 temp dir and is removed either way.
+    const shotsDir = join(homedir(), 'Downloads', 'modlens-screenshots')
+    await mkdir(shotsDir, { recursive: true })
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const outPath = join(shotsDir, `screenshot-${stamp}-${mode}.png`)
+    // UTF-8 BOM: powershell.exe 5.1 reads a BOM-less .ps1 as ANSI (GBK on
+    // Chinese Windows), which garbles the Chinese hint text below.
+    // Hot-reload seam: an override script on disk wins over the built-in
+    // template, so the capture UI can be tweaked without restarting DSH.
+    await writeFile(scriptPath, `﻿${CAPTURE_SCRIPT(ui)}`, { mode: 0o600 })
+    const { code, stderr } = await runCapture(scriptPath, outPath, mode, signal, direct)
+    // The temp dir only ever holds the .ps1; clean it on every exit path.
+    await rm(dir, { recursive: true, force: true })
+    if (code === 2) {
+      // User dismissed (Esc on the banner or the region overlay): no image.
+      return { cancelled: true }
+    }
+    if (code !== 0) {
+      throw new Error((stderr || 'unknown capture error').trim().slice(0, 500))
+    }
+    return { path: outPath }
+  } finally {
+    captureBusy = false
+  }
+}
+
+function runCapture(scriptPath, outPath, mode, signal, direct) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-WindowStyle',
+        'Hidden',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        scriptPath,
+        '-OutPath',
+        outPath,
+        '-Mode',
+        mode,
+        ...(direct ? ['-Direct'] : []),
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, signal },
+    )
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error('screenshot capture timed out'))
+    }, CAPTURE_TIMEOUT_MS)
+    child.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({ code, stdout, stderr })
+    })
+  })
+}
+
+function registerScreenshotRoute(host) {
+  host.webServer.register({
+    name: 'dsh-screenshot',
+    kind: 'exact',
+    path: '/dsh-screenshot/screenshot',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        res.writeHead(405)
+        res.end()
+        return
+      }
+      const remote = req.socket?.remoteAddress ?? ''
+      const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+      if (!loopback) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'screenshot route is loopback-only' }))
+        return
+      }
+      const params = new URL(req.url, 'http://localhost').searchParams
+      const mode = params.get('mode') === 'region' ? 'region' : 'full'
+      const direct = params.get('direct') === '1'
+      try {
+        const shot = await captureScreenshot(mode, undefined, direct)
+        if (shot.cancelled) {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ cancelled: true }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ path: shot.path }))
+      } catch (error) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: String(error?.message ?? error) }))
+      }
+    },
+  })
+}
+
+const screenshotTool = (toolName) => ({
+  name: toolName,
+  description:
+    "Capture this machine's screen to a PNG and read it through the modlens vision bridge, returning the same structured evidence as modlens_read_image plus the screenshot file path. Use when the user asks what is on their screen, wants a UI inspected, or asks for a screenshot. Mode 'full' captures the whole virtual desktop without interaction; mode 'region' pops an on-screen selection overlay the user must drag (blocks until they choose or press Esc). Requires a configured modlens engine (run `npx @liustack/modlens doctor` to check) and an interactive desktop session.",
+  parameters: {
+    type: 'object',
+    properties: {
+      mode: {
+        type: 'string',
+        enum: ['full', 'region'],
+        description:
+          "'full' (default) captures the whole virtual desktop; 'region' shows an overlay and asks the user to drag-select an area",
+      },
+      prompt: {
+        type: 'string',
+        description: 'Optional extra focus for the reading (e.g. "read the error message")',
+      },
+    },
+  },
+  output: {
+    schema: OUTPUT_SCHEMA,
+    render: (_args, value) => [{ type: 'text', text: renderEvidence(value) }],
+  },
+  timeoutMs: CLI_TIMEOUT_MS + CAPTURE_TIMEOUT_MS + 20_000,
+  isConcurrencySafe: () => false,
+  presentCall: (args) => ({
+    card: 'generic',
+    title: toolName,
+    kind: 'read',
+    rawInput: args,
+  }),
+  async execute(args, exec) {
+    const mode = args?.mode === 'region' ? 'region' : 'full'
+    const shot = await captureScreenshot(mode, exec.signal)
+    if (shot.cancelled) {
+      return {
+        summary: 'The screenshot was cancelled: the region selection was dismissed (Esc) with no image captured.',
+        ocr: { full_text: '', lines: [] },
+        layout: { regions: [] },
+        semantics: { scene: '', entities: [] },
+        visual: {},
+        uncertainty: ['capture cancelled'],
+      }
+    }
+    const cliArgs = [CLI_PATH, '-i', shot.path, '--timeout', String(CLI_TIMEOUT_MS)]
+    if (args?.prompt) {
+      cliArgs.push('--prompt', args.prompt)
+    }
+    const { stdout, stderr, code } = await run(process.execPath, cliArgs, exec.signal)
+    if (code !== 0) {
+      throw new Error(`modlens failed (exit ${code}): ${(stderr || stdout).trim().slice(0, 500)}`)
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(stdout)
+    } catch {
+      throw new Error(`modlens produced no JSON: ${stdout.trim().slice(0, 300)}`)
+    }
+    return { ...parsed.result, screenshotPath: shot.path }
+  },
+})
+
+function run(command, args, signal) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      signal,
+      // In the packaged desktop app process.execPath is the Electron binary;
+      // this makes it behave as plain node for the spawned CLI (issue #25).
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ stdout, stderr, code }))
+  })
+}
+
+function renderEvidence(value) {
+  const lines = [value.summary]
+  const text = value.ocr?.full_text?.trim()
+  if (text) {
+    lines.push('', 'Transcription:', text.length > 4000 ? `${text.slice(0, 4000)}…` : text)
+  }
+  const uncertainty = value.uncertainty ?? []
+  if (uncertainty.length > 0) {
+    lines.push('', `Uncertain: ${uncertainty.join('; ')}`)
+  }
+  return lines.join('\n')
+}
+
+export function apply(ctx, config = {}) {
+  resolveUi(config)
+  // Loopback-only capture route for the browser hotkeys.
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (scope) => {
+      if (config.route !== false) {
+        try {
+          registerScreenshotRoute(scope)
+        } catch (error) {
+          console.error('[dsh-screenshot] route skipped:', error)
+        }
+      }
+    })
+  }
+  // Agent-facing tool: capture + read through modlens in one call. Skipped
+  // cleanly when no modlens CLI is resolvable - the capture route still works.
+  // The name is shared with @liustack/modlens, which registers the same
+  // modlens_screenshot tool; when it wins the race we degrade silently (the
+  // tool is functionally identical) instead of spamming a duplicate stack.
+  if (CLI_PATH && config.tool !== false) {
+    try {
+      ctx.tools.register(screenshotTool('modlens_screenshot'))
+    } catch (error) {
+      const msg = String(error?.message ?? error)
+      if (/already registered/i.test(msg)) {
+        // modlens already mounted an equivalent tool - nothing to do.
+        return
+      }
+      console.error('[dsh-screenshot] tool skipped:', error)
+    }
+  }
+}

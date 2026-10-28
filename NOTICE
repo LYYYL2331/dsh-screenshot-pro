@@ -1,0 +1,33 @@
+This package is a modified fork of dsh-screenshot.
+
+  Upstream: https://github.com/paicat1/dsh-screenshot
+  Upstream version used: 1.2.0
+  Upstream license: MIT (see LICENSE, Copyright (c) 2026 paicat1)
+
+Modifications (2026-10-29):
+
+  dsh/index.js
+    - Screen bounds limited to the primary monitor (upstream captured the
+      whole virtual desktop, which spans every display).
+    - DPI awareness upgraded to Per-Monitor V2, with fallbacks to
+      Per-Monitor and System DPI awareness (upstream used System DPI only,
+      which made the overlay render stretched on a 125% secondary display).
+    - Form.AutoScaleMode set to None so overlay children are positioned in
+      exact physical pixels (upstream let WinForms scale them).
+    - Region selection waits for an explicit confirm: dragging, clicking a
+      window, and clicking the empty desktop all hold the frozen frame and
+      show 确定 / 取消 buttons. Upstream captured immediately on mouse-up.
+    - Confirm buttons are shown 320 ms after release and ignore clicks that
+      are part of the release gesture.
+    - Window-snap hover highlight is suppressed while a selection exists, so
+      the frozen frame cannot change after release.
+    - Dim overlay opacity tuned to 135/255 to match WeChat's screenshot veil.
+
+  dsh/client.js
+    - Two on-screen buttons (instant full-screen capture, region selection);
+      upstream exposed hotkeys only.
+    - Hotkeys retained: Ctrl+Alt+S (arrange then capture) and
+      Ctrl+Shift+Alt+S (instant full screen).
+
+No other files were modified. The upstream copyright notice and the full
+MIT license text are preserved in LICENSE.
