@@ -1,7 +1,7 @@
 {
   "name": "dsh-screenshot-pro",
   "version": "2.0.0",
-  "description": "Screen capture for DeepSeek Harness with a confirm step: drag, review, then confirm. Primary-monitor only, per-monitor DPI safe. Fork of @paicat1/dsh-screenshot.",
+  "description": "A visible screenshot button for DeepSeek Harness: click, drag, confirm. Fork of @paicat1/dsh-screenshot.",
   "repository": {
     "type": "git",
     "url": "https://github.com/LYYYL2331/dsh-screenshot-pro"
